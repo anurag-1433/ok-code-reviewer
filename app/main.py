@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 import os
+import threading
 from dotenv import load_dotenv
 
 from app.github.auth import get_installation_token
@@ -18,20 +19,34 @@ load_dotenv()
 app = FastAPI()
 
 
+# -------------------------
+# Health check (REQUIRED for Render)
+# -------------------------
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
+
+
+# -------------------------
+# GitHub Webhook
+# -------------------------
 @app.post("/webhooks/github")
 async def github_webhook(request: Request):
     payload = await request.json()
 
-    # Only handle PR open / update events
+    # Only PR open / update
     if payload.get("action") not in ["opened", "synchronize"]:
         return {"status": "ignored"}
 
-    # IMPORTANT: respond immediately to GitHub
-    process_pr(payload)
+    # Run in background thread (non-blocking)
+    threading.Thread(target=process_pr, args=(payload,)).start()
 
     return {"status": "accepted"}
 
 
+# -------------------------
+# PR Processing Logic
+# -------------------------
 def process_pr(payload: dict):
     try:
         pr = payload["pull_request"]
@@ -52,52 +67,41 @@ def process_pr(payload: dict):
         parsed = parse_pr_files(files)
         context = build_context(parsed)
 
-        # AI review (resilient)
         try:
             review = review_code(context)
         except Exception as e:
             print("AI error:", e)
             review = (
                 "⚠️ **AI review temporarily unavailable**\n\n"
-                "The model is currently overloaded. "
-                "This PR will be reviewed again on the next update."
+                "The model is overloaded. The PR will be reviewed again on the next update."
             )
 
-        BOT_NAME = "ok-code-reviewer[bot]"
+        bot_name = "ok-code-reviewer[bot]"
         comment_body = f"🤖 **AI Code Review**\n\n{review}"
 
         existing_comment_id = find_existing_ai_comment(
-            owner,
-            repo_name,
-            pr_number,
-            token,
-            BOT_NAME,
+            owner, repo_name, pr_number, token, bot_name
         )
 
         if existing_comment_id:
             update_pr_comment(
-                owner,
-                repo_name,
-                existing_comment_id,
-                token,
-                comment_body,
+                owner, repo_name, existing_comment_id, token, comment_body
             )
         else:
             post_pr_comment(
-                owner,
-                repo_name,
-                pr_number,
-                token,
-                comment_body,
+                owner, repo_name, pr_number, token, comment_body
             )
 
     except Exception as e:
-        # NEVER crash the webhook
+        # Never crash webhook
         print("Webhook processing error:", e)
 
+
+# -------------------------
+# Local run (Render ignores this)
+# -------------------------
 if __name__ == "__main__":
     import uvicorn
-    import os
 
     uvicorn.run(
         "app.main:app",
